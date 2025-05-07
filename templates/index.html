@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Debt Collection Agent | Enhanced UI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <!-- Optional: Google Fonts for a nicer font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-layout">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <img src="https://via.placeholder.com/40x40.png?text=FC" alt="Company Logo" class="logo"> <!-- Placeholder logo -->
+                <h2>FinCollect AI</h2>
+            </div>
+            <div class="customer-selector-container">
+                <label for="customerSelect">Select Customer Case:</label>
+                <select id="customerSelect">
+                    <option value="">-- Choose a Case --</option>
+                    {% for id, data in customers.items() %}
+                    <option value="{{ id }}">{{ data.name }} (ID: {{ id }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="sidebar-footer">
+                <p>© 2024 Your Company</p>
+            </div>
+        </aside>
+
+        <main class="chat-interface">
+            <div class="chat-header">
+                <h1>Conversation with: <span id="currentCustomerName">N/A</span></h1>
+                <span class="status-indicator" id="agentStatus">Awaiting Selection</span>
+            </div>
+            <div class="chat-box-wrapper">
+                <div class="chat-box" id="chatBox">
+                    <!-- Initial message will be populated by JS -->
+                    <div class="message-placeholder">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M17 18a2 2 0 0 0-2-2H9a2 2 0 0 0-2 2"/><rect x="3" y="4" width="18" height="18" rx="2"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>
+                        <p>Please select a customer case from the sidebar to begin.</p>
+                    </div>
+                </div>
+            </div>
+            <div class="chat-input-area">
+                <button id="micButton" class="icon-button" title="Use Microphone" disabled>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path><path d="M19 10v2a7 7 0 0 1-14 0v-2"></path><line x1="12" y1="19" x2="12" y2="22"></line></svg>
+                </button>
+                <input type="text" id="userInput" placeholder="Type your response here..." disabled>
+                <button id="sendButton" class="icon-button" title="Send Message" disabled>
+                    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                </button>
+            </div>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
