@@ -1,324 +1,291 @@
 import os
-import json
-from flask import Flask, render_template, request, jsonify
-from dotenv import load_dotenv
 import google.generativeai as genai
-import nltk
-from nltk import data
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import spacy
-from pymongo import MongoClient # Import MongoClient
-from datetime import datetime # To store timestamps
-import uuid # To generate unique conversation IDs if needed
+from flask import Flask, request, jsonify, render_template
+from dotenv import load_dotenv
+import json
 
-# --- NLTK Setup ---
-# ... (keep your existing NLTK setup)
-try:
-    sid = SentimentIntensityAnalyzer()
-except LookupError:
-    print("Downloading VADER lexicon...")
-    nltk.download('vader_lexicon')
-    sid = SentimentIntensityAnalyzer()
-
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
-    print("Downloading Punkt tokenizer...")
-    nltk.download('punkt')
-
-
-# --- SpaCy Setup ---
-# ... (keep your existing SpaCy setup)
-NLP_SPACY = None
-try:
-    NLP_SPACY = spacy.load('en_core_web_sm')
-    print("SpaCy 'en_core_web_sm' model loaded successfully.")
-except OSError:
-    print("SpaCy 'en_core_web_sm' model not found. Please run:")
-    print("python -m spacy download en_core_web_sm")
-
+# --- New Imports for STT/TTS ---
+import speech_recognition as sr
+import pyttsx3
+import base64
+import io
+from pydub import AudioSegment  # For audio conversion
 
 load_dotenv()
 
+# --- Configure Gemini API ---
+try:
+    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    model = genai.GenerativeModel('gemini-1.5-flash')  # Or your preferred model
+except Exception as e:
+    print(f"Error configuring Gemini: {e}")
+    model = None
+
+# --- Initialize TTS Engine ---
+try:
+    tts_engine = pyttsx3.init()
+    voices = tts_engine.getProperty('voices')
+    # You might want to select a specific voice if available
+    # For example, find a US English female voice
+    selected_voice = None
+    for voice in voices:
+        if "english" in voice.name.lower() and "united states" in voice.name.lower() and voice.gender == 'female':
+            selected_voice = voice.id
+            break
+        elif "zira" in voice.name.lower():  # Common Windows voice
+            selected_voice = voice.id
+            break
+        elif "samantha" in voice.name.lower():  # Common macOS voice
+            selected_voice = voice.id
+            break
+    if selected_voice:
+        tts_engine.setProperty('voice', selected_voice)
+    tts_engine.setProperty('rate', 140)  # Adjust speed
+    tts_engine.setProperty('volume', 0.9)  # Adjust volume
+except Exception as e:
+    print(f"Error initializing TTS engine: {e}")
+    tts_engine = None
+
 app = Flask(__name__)
 
-# --- Configuration (Gemini, Customers, Company Name) ---
-# ... (keep your existing Gemini, CUSTOMERS_DATA, YOUR_COMPANY_NAME)
-GEMINI_API_KEY = os.getenv("GOOGLE_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
-
-gemini_model = genai.GenerativeModel( # ... your model config
-    model_name="gemini-1.5-flash-latest",
-    safety_settings=[
-        {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-        {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-        {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-    ],
-    generation_config={
-        "temperature": 0.7, "top_p": 1, "top_k": 1, "max_output_tokens": 2048,
+# --- Customer Data (same as before) ---
+# ... (Keep your customer_data dictionary here) ...
+customer_data = {
+    "CUST001": {
+        "name": "Alice Wonderland",
+        "outstanding_balance": 1250.75,
+        "last_payment_date": "2023-04-15",
+        "payment_due_date": "2023-05-20",
+        "account_status": "active",
+        "notes": "Inquired about payment plan options last month. Prefers email communication.",
+        "sentiment_history": ["neutral", "slightly_anxious"]
+    },
+    "CUST002": {
+        "name": "Bob The Builder",
+        "outstanding_balance": 0.00,
+        "last_payment_date": "2023-05-01",
+        "payment_due_date": "N/A",
+        "account_status": "paid_in_full",
+        "notes": "Long-term customer, always pays on time. Expressed interest in new services.",
+        "sentiment_history": ["positive", "neutral"]
+    },
+    "CUST003": {
+        "name": "Charlie Brown",
+        "outstanding_balance": 300.50,
+        "last_payment_date": "2023-03-10",
+        "payment_due_date": "2023-04-05",
+        "account_status": "overdue",
+        "notes": "Has been sent two reminder notices. Previously mentioned temporary financial hardship.",
+        "sentiment_history": ["anxious", "frustrated", "anxious"]
     }
-)
-CUSTOMERS_DATA = {
-    "101": {"name": "Alice Wonderland", "amount_due": "150.75", "currency": "USD", "loan_info": "Personal Loan #PL7890", "last_contact_outcome": "Promised to pay next week.", "due_date": "2024-07-15"},
-    "102": {"name": "Bob The Builder", "amount_due": "320.50", "currency": "USD", "loan_info": "Credit Card Account ending 1234", "last_contact_outcome": "Stated difficulty paying.", "due_date": "2024-07-10"},
-    "103": {"name": "Charlie Brown", "amount_due": "85.00", "currency": "USD", "loan_info": "Overdue Invoice #INV2024-005", "last_contact_outcome": "No answer.", "due_date": "2024-06-30"}
 }
-YOUR_COMPANY_NAME = "Asset Telematics."
+YOUR_COMPANY_NAME = "Asset Telematics"
 
 
-# --- MongoDB Setup ---
-MONGO_URI = os.getenv("MONGO_URI")
-mongo_client = None
-db = None
-conversations_collection = None
-
-try:
-    if not MONGO_URI:
-        print("MONGO_URI not found in .env file. Skipping MongoDB integration.")
-    else:
-        mongo_client = MongoClient(MONGO_URI,serverSelectionTimeoutMS=3000)
-        # Pymongo will create the DB and collection if they don't exist on first write.
-        # Let's use the DB name from the URI or a default if not specified there.
-        # If your URI is 'mongodb://localhost:27017/' without a db name, client.get_database() is better.
-        # If your URI is 'mongodb://localhost:27017/chat_app_db', then client.chat_app_db works.
-        # Let's try to parse it or use a default.
-        db_name_from_uri = MONGO_URI.split('/')[-1].split('?')[0] if '/' in MONGO_URI else 'chat_app_db'
-        db = mongo_client[db_name_from_uri if db_name_from_uri else 'chat_app_db']
-
-        conversations_collection = db["conversations"]
-        # Test connection
-        mongo_client.admin.command('ping')
-        print(f"Successfully connected to MongoDB! Using database: {db.name}, collection: {conversations_collection.name}")
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    mongo_client = None # Ensure it's None if connection failed
-    conversations_collection = None
-
-
-# --- NLP Utilities ---
-# ... (keep get_sentiment and extract_entities_spacy)
-def get_sentiment(text):
-    scores = sid.polarity_scores(text)
-    compound = scores['compound']
-    if compound >= 0.05: return "positive"
-    elif compound <= -0.05: return "negative"
-    else: return "neutral"
-
-def extract_entities_spacy(text):
-    if not NLP_SPACY: return {}
-    doc = NLP_SPACY(text)
-    entities = {}
-    for ent in doc.ents:
-        if ent.label_ not in entities: entities[ent.label_] = []
-        entities[ent.label_].append(ent.text)
-    return entities
-
-# --- Prompt Generation (Using your more autonomous version) ---
-def get_initial_system_prompt(customer_id, user_sentiment_hint=None, extracted_entities_hint=None):
-    customer = CUSTOMERS_DATA.get(str(customer_id))
+def get_system_prompt(customer_id):
+    customer = customer_data.get(customer_id)
     if not customer:
-        return "You are a helpful AI assistant. The user selected an invalid customer ID."
+        return f"You are FinBot, a friendly and empathetic AI collections agent from {YOUR_COMPANY_NAME}. The user has selected an invalid customer ID. Apologize and ask them to select a valid customer."
 
-    sentiment_instruction = ""
-    if user_sentiment_hint == "negative":
-        sentiment_instruction = "The customer seems to be feeling negative or stressed. Be extra patient, empathetic, and reassuring. Acknowledge their difficulty directly."
-    elif user_sentiment_hint == "positive":
-        sentiment_instruction = "The customer seems to be feeling positive. Maintain a warm and collaborative tone."
+    # Refined prompt
+    prompt = f"""
+    You are FinBot, an advanced, empathetic, and highly skilled AI collections agent from {YOUR_COMPANY_NAME}.
+    Your primary goal is to understand the customer's situation, remind them of their outstanding balance, and collaboratively find a resolution, such as making a payment or setting up a payment plan.
+    You are currently speaking with {customer['name']}.
 
-    entity_awareness_instruction = ""
-    if extracted_entities_hint and extracted_entities_hint != {}: # Check if not empty
-        entity_awareness_instruction = f"The user's message mentioned: {json.dumps(extracted_entities_hint)}. Use this to understand their specific request (e.g., a date or amount they proposed)."
-
-    payment_options_rules = f"""
-    Your Allowed Actions & Payment Negotiation Rules:
-    - Your primary goal is to secure payment for the outstanding amount of {customer['amount_due']} {customer['currency']} for {customer['loan_info']}.
-    - You ARE AUTHORIZED to propose the following if the customer expresses difficulty paying by the due date ({customer['due_date']}):
-        1. A short extension: "I can offer you a one-time extension of up to 7 days from the original due date ({customer['due_date']}). Would paying by [calculate new date] work for you?"
-        2. Split payment: "If it helps, we could potentially split the payment of {customer['amount_due']} into two equal installments. The first would be due within 7 days, and the second 7 days after that. Is this something you'd like to consider?"
-        3. Promise to pay full amount later: "If you need a bit more time for the full amount, what specific date within the next 10 days could you commit to paying {customer['amount_due']}?"
-    - If the customer proposes a date or plan that fits these rules, you can tentatively accept it. For example: "Okay, I can note your commitment to pay {customer['amount_due']} by [customer's proposed date, if within 10 days]. I'll update our records with this promise to pay."
-    - If the customer proposes something outside these rules (e.g., wants a discount, a much longer extension, or a very small partial payment), you should state: "I understand that might be your preference, but the options I can currently offer are [re-iterate allowed options briefly]. If these don't work, I can make a note of your situation, and a specialist from our team will review your account for any other possibilities and contact you."
-    - DO NOT make up new payment plans or agree to terms outside of these explicit rules.
-    - After a customer agrees to a specific plan YOU proposed or a date they proposed (that fits your rules), confirm it clearly: "Great, so to confirm, you'll be making a payment of [amount] by [date]. I've made a note of this in your account. Please ensure the payment is made by then to keep your account in good standing."
-    - If the user asks HOW to pay, you can say: "You can make a payment through our online portal at [YourCompanyWebsite.com/pay] or by calling us at [YourPhoneNumber]."
-    """ # Shortened for brevity, use your full prompt
-
-    return f"""
-    You are "FinBot", an AI collections agent... (rest of your detailed prompt) ...
-    {sentiment_instruction}
-    {entity_awareness_instruction}
-    Customer Details (For your context ONLY):
+    Customer Details:
     - Name: {customer['name']}
-    - Amount Due: {customer['amount_due']} {customer['currency']}
-    - Regarding: {customer['loan_info']}
-    - Due Date: {customer['due_date']}
-    - Last Contact Outcome: {customer['last_contact_outcome']}
-    {payment_options_rules}
-    Conversation Flow: ...
-    Initial Interaction Example: ...
-    Your first response after the user's initial message should directly address the collection and try to guide them towards one of your allowed solutions.
-    BE VERY CLEAR about amounts and dates when confirming.
+    - Outstanding Balance: ${customer['outstanding_balance']:.2f}
+    - Last Payment Date: {customer['last_payment_date']}
+    - Payment Due Date: {customer['payment_due_date']}
+    - Account Status: {customer['account_status']}
+    - Internal Notes: {customer['notes']}
+    - Recent Sentiment: {', '.join(customer['sentiment_history'][-2:]) if customer['sentiment_history'] else 'N/A'}
+
+    Your Interaction Style:
+    1.  Empathetic & Understanding: Always start by acknowledging the customer's feelings if they express any hardship or emotion. Use phrases like "I understand this can be a difficult situation," or "I appreciate you sharing that with me."
+    2.  Clear & Concise: Provide information clearly, especially regarding balances and dates.
+    3.  Solution-Oriented: Proactively suggest solutions like payment plans if the customer indicates difficulty paying the full amount.
+    4.  Professional & Polite: Maintain a professional tone. Never be accusatory or aggressive.
+    5.  Information Gathering (Subtle): If the customer is hesitant, try to understand the reason for non-payment without being intrusive. For example, "Is there anything preventing you from making a payment at this time?"
+    6.  Maintain Context: Refer to previous parts of the conversation. Your memory (the chat history) is provided.
+    7.  Call to Action: Gently guide the conversation towards a resolution (payment, payment plan).
+    8.  Do NOT Hallucinate: Only use the information provided about the customer. Do not invent new services, policies, or details not present in their record or your company's general knowledge.
+    9.  Company Name: When relevant, mention you are from {YOUR_COMPANY_NAME}.
+    10. Brevity: Keep responses reasonably concise, aiming for 1-3 sentences unless more detail is essential. Avoid long monologues.
+    11. First Interaction: Your first message in any new conversation with a selected customer should be: "Hello, I'm FinBot from {YOUR_COMPANY_NAME}. I understand you're {customer['name']}. How are you feeling today?"
+
+    Conversation Flow Example:
+    - If customer says they can't pay: "I understand things can be tight sometimes. We might be able to set up a payment plan. Would that be helpful?"
+    - If customer is angry: "I hear your frustration, and I want to help resolve this. Let's see what we can do."
+    - If customer agrees to pay: "That's great to hear! You can make a payment of ${customer['outstanding_balance']:.2f} through our online portal or I can guide you through other options. Which do you prefer?"
+
+    Your responses should be plain text. Do not use markdown.
     """
-# --- Function to Save Conversation Turn ---
-def save_conversation_turn(customer_id, role, message_text, sentiment=None, entities=None, conversation_id=None):
-    if conversations_collection is None:
-        print("MongoDB not configured. Skipping save")
-
-
-
-    # We'll generate a new conversation_id for each request for simplicity now.
-    # For true session tracking, this ID would need to be managed across requests.
-    if conversation_id is None:
-        # A simple way to group turns related to one customer session (though not strictly a "session")
-        # You might want a more robust session ID generated on the client or first interaction
-        conversation_id = str(uuid.uuid4()) # Generates a unique ID for this turn/interaction
-
-
-    turn_data = {
-        "conversation_id": conversation_id, # Helps group a sequence of user/bot messages if managed
-        "customer_id": str(customer_id),
-        "role": role,  # "user" or "model"
-        "message": message_text,
-        "timestamp": datetime.utcnow() # Store time in UTC
-    }
-    if sentiment:
-        turn_data["sentiment"] = sentiment
-    if entities:
-        turn_data["entities"] = entities
-
-    try:
-        insert_result = conversations_collection.insert_one(turn_data)
-        print(f"Saved to MongoDB with id: {insert_result.inserted_id}")
-    except Exception as e:
-        print(f"Error saving to MongoDB: {e}")
+    return prompt
 
 
 @app.route('/')
 def index():
-    return render_template('index.html', customers=CUSTOMERS_DATA)
+    return render_template('index.html', customers=customer_data, company_name=YOUR_COMPANY_NAME)
 
 
 @app.route('/chat', methods=['POST'])
-def chat_endpoint():
-    # ... (keep global NLP_SPACY if needed, or ensure it's passed/accessible)
+def chat():
+    if not model:
+        return jsonify({"error": "Generative AI model not initialized"}), 500
+    if not tts_engine:
+        return jsonify({"error": "TTS engine not initialized"}), 500
+
+    data = request.json
+    user_message = data.get('message')
+    history = data.get('history', [])
+    customer_id = data.get('customerId')
+
+    if not user_message or not customer_id:
+        return jsonify({"error": "Missing message or customerId"}), 400
+
+    system_prompt_text = get_system_prompt(customer_id)
+
+    # Construct messages for Gemini, including system prompt and history
+    # The system prompt is now handled by `system_instruction` parameter for `GenerativeModel`
+    # However, for `start_chat`, we can prepend it or use it as the first model message if user starts.
+    # For simplicity, let's adapt to the typical chat history format.
+
+    # The initial greeting from the bot is part of the history sent by the client
+    # So, history already contains:
+    # 1. {role: "model", parts: [{text: "Hello, I'm FinBot..."}]}
+    # 2. {role: "user", parts: [{text: user's_first_response}]}
+    # ... and so on.
+
+    # For Gemini, system instructions are best set at model initialization or `start_chat`
+    # Let's ensure the history is correctly formatted
+    formatted_history = []
+    for item in history:
+        # Ensure 'parts' is a list of dictionaries with a 'text' key
+        if isinstance(item.get('parts'), list) and \
+                all(isinstance(part, dict) and 'text' in part for part in item['parts']):
+            formatted_history.append({'role': item['role'], 'parts': item['parts']})
+        elif isinstance(item.get('parts'), str):  # Older format, adapt
+            formatted_history.append({'role': item['role'], 'parts': [{'text': item['parts']}]})
+
     try:
-        data = request.get_json()
-        user_message_text = data.get('message')
-        conversation_history_client = data.get('history', []) # Client-side history
-        customer_id = data.get('customerId')
-        # Optional: Client could send a session_id if you implement session management
-        # current_conversation_id = data.get('conversationId', str(uuid.uuid4())) # Generate if not provided
+        # Start a chat session with the existing history and system instruction
+        # Note: System instruction might be better applied when model is initialized for overall behavior.
+        # For per-chat context, including it in the history as a special first message or
+        # using model.generate_content with system_instruction param is often preferred.
+        # Since Gemini's `start_chat` takes `history`, we build on that.
+        # The system prompt is quite long; ensure it's effectively used.
+        # One way is to prepend it as a model utterance that the user doesn't see but sets context.
+        # Or, if model supports it, a dedicated system message.
 
-        if not user_message_text or not customer_id:
-            return jsonify({"error": "Missing message or customerId"}), 400
+        # Current approach: System prompt is for context setting, client sends initial bot message.
+        # We'll pass the full context (system prompt + history + new message)
 
-        # --- NLTK Sentiment Analysis of User Input ---
-        user_sentiment = get_sentiment(user_message_text)
-        print(f"User Sentiment (NLTK VADER): {user_sentiment} for message: '{user_message_text}'")
+        chat_session = model.start_chat(history=formatted_history)
+        # The system prompt needs to be "told" to the model.
+        # One way: prepend it to the user's message or treat it as an initial system-level turn.
+        # For this example, we are providing a very detailed system prompt.
+        # Let's make it the first "model" turn in the mind of the AI if not explicitly supported as system instruction in start_chat.
+        # The current `get_system_prompt` is more of a full context document.
 
-        # --- SpaCy Named Entity Recognition ---
-        extracted_entities = {}
-        if NLP_SPACY:
-            extracted_entities = extract_entities_spacy(user_message_text)
-            print(f"Extracted Entities (SpaCy): {extracted_entities} for message: '{user_message_text}'")
+        # The initial greeting is already in history from client.
+        # We should feed the system prompt to the model.
+        # The `system_instruction` parameter in `GenerativeModel` is good for this.
+        # Re-initialize model with system instruction for this customer
+        # This is not ideal for every call, but for demonstration:
 
-        # --- Save User Message to MongoDB ---
-        # For now, let's generate a simple interaction_id for this pair of user/bot messages
-        interaction_id_for_db = str(uuid.uuid4())
-        save_conversation_turn(
-            customer_id=customer_id,
-            role="user",
-            message_text=user_message_text,
-            sentiment=user_sentiment,
-            entities=extracted_entities,
-            conversation_id=interaction_id_for_db # Use the same ID for the bot's response in this turn
+        _model = genai.GenerativeModel(
+            'gemini-1.5-flash',  # or your chosen model
+            system_instruction=system_prompt_text
         )
+        chat_session = _model.start_chat(history=formatted_history)  # history should NOT include system prompt now
 
-        customer = CUSTOMERS_DATA.get(str(customer_id))
-        if not customer:
-            return jsonify({"error": "Invalid customerId"}), 400
-
-        system_prompt_text = get_initial_system_prompt(
-            customer_id,
-            user_sentiment_hint=user_sentiment,
-            extracted_entities_hint=extracted_entities
-        )
-
-        # ... (Your existing logic for building gemini_history with the system_prompt_text) ...
-        # (Ensure this logic is correct as per previous discussions)
-        temp_history_for_gemini = []
-        current_turn_context_parts = [{'text': system_prompt_text}]
-        if not conversation_history_client:
-            temp_history_for_gemini.append({'role': 'user', 'parts': current_turn_context_parts})
-        else:
-            temp_history_for_gemini.append({'role': 'user', 'parts': current_turn_context_parts})
-            for item in conversation_history_client:
-                is_system_prompt_like = 'You are "FinBot"' in item['parts'][0]['text'] and item['role'] == 'user'
-                if not is_system_prompt_like:
-                    temp_history_for_gemini.append(item)
-        temp_history_for_gemini.append({'role': 'user', 'parts': [{'text': user_message_text}]})
-
-        final_gemini_history = []
-        if temp_history_for_gemini:
-            final_gemini_history.append(temp_history_for_gemini[0])
-            for i in range(1, len(temp_history_for_gemini)):
-                if temp_history_for_gemini[i]['role'] != final_gemini_history[-1]['role']:
-                    final_gemini_history.append(temp_history_for_gemini[i])
-                else:
-                    final_gemini_history[-1]['parts'][0]['text'] += "\n" + temp_history_for_gemini[i]['parts'][0]['text']
-
-        if not final_gemini_history or final_gemini_history[-1]['role'] != 'user':
-             return jsonify({"error": "Invalid history structure for Gemini"}), 500
-
-        chat_session = gemini_model.start_chat(history=final_gemini_history[:-1])
-        response = chat_session.send_message(final_gemini_history[-1]['parts'][0]['text'])
+        response = chat_session.send_message(user_message)
         bot_response_text = response.text
 
-        # --- Save Bot Response to MongoDB ---
-        save_conversation_turn(
-            customer_id=customer_id,
-            role="model", # Or "bot", "assistant" - be consistent
-            message_text=bot_response_text,
-            conversation_id=interaction_id_for_db # Use the same ID as the user message for this turn
-        )
+        # --- TTS ---
+        audio_bytes_io = io.BytesIO()
+        tts_engine.save_to_file(bot_response_text, audio_bytes_io)  # pyttsx3 can't save directly to BytesIO
 
-        # Consider returning the conversation_id to the client if it needs to manage session state
-        # return jsonify({"response": bot_response_text, "conversationId": current_conversation_id})
-        return jsonify({"response": bot_response_text})
+        # Workaround for pyttsx3 not saving to BytesIO directly:
+        temp_audio_filename = "temp_response.wav"  # or .mp3 if you configure pyttsx3 for it
+        tts_engine.save_to_file(bot_response_text, temp_audio_filename)
+        tts_engine.runAndWait()  # Important to ensure file is written before reading
+
+        with open(temp_audio_filename, "rb") as audio_file:
+            audio_data = audio_file.read()
+        os.remove(temp_audio_filename)  # Clean up temp file
+
+        audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+
+        return jsonify({
+            "response": bot_response_text,
+            "audio_base64": audio_base64,  # Send audio data
+            "audio_format": "wav"  # Specify format
+        })
 
     except Exception as e:
         print(f"Error in /chat: {e}")
-        import traceback
-        traceback.print_exc()
-        # ... (your existing error handling for Gemini) ...
-        if hasattr(e, 'response') and hasattr(e.response, 'prompt_feedback') and e.response.prompt_feedback.block_reason:
-            return jsonify({"error": f"Message blocked by API: {e.response.prompt_feedback.block_reason}"}), 500
-        if "SAFETY" in str(e).upper():
-             return jsonify({"error": "Content blocked due to safety settings."}), 500
-        return jsonify({"error": f"An internal error occurred: {str(e)}"}), 500
+        # Try to provide a fallback TTS for the error message itself
+        error_message_text = "I encountered an issue processing your request. Please try again."
+        try:
+            temp_audio_filename = "temp_error.wav"
+            tts_engine.save_to_file(error_message_text, temp_audio_filename)
+            tts_engine.runAndWait()
+            with open(temp_audio_filename, "rb") as audio_file:
+                audio_data = audio_file.read()
+            os.remove(temp_audio_filename)
+            audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+            return jsonify({
+                "response": error_message_text,
+                "audio_base64": audio_base64,
+                "audio_format": "wav"
+            }), 500
+        except Exception as tts_e:
+            print(f"Error generating TTS for error message: {tts_e}")
+            return jsonify({"error": str(e), "response": error_message_text}), 500
+
+
+# --- New STT Endpoint ---
+@app.route('/transcribe', methods=['POST'])
+def transcribe_audio():
+    if 'audio_data' not in request.files:
+        return jsonify({"error": "No audio file part"}), 400
+
+    file = request.files['audio_data']
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    recognizer = sr.Recognizer()
+
+    try:
+        # The browser might send webm or ogg. SpeechRecognition needs wav.
+        # Convert using pydub
+        audio = AudioSegment.from_file(file, format=file.content_type.split('/')[-1])  # e.g. "webm"
+
+        # Export to a temporary WAV file in memory (BytesIO)
+        wav_io = io.BytesIO()
+        audio.export(wav_io, format="wav")
+        wav_io.seek(0)  # Reset pointer to the beginning of the BytesIO object
+
+        with sr.AudioFile(wav_io) as source:
+            audio_data = recognizer.record(source)  # read the entire audio file
+
+        # Recognize speech using Google Web Speech API (requires internet)
+        # You can add try-except blocks for different recognizers (Sphinx for offline, etc.)
+        text = recognizer.recognize_google(audio_data)
+        return jsonify({"transcript": text})
+    except sr.UnknownValueError:
+        print("Google Web Speech API could not understand audio")
+        return jsonify({"error": "Could not understand audio"}), 400
+    except sr.RequestError as e:
+        print(f"Could not request results from Google Web Speech API; {e}")
+        return jsonify({"error": f"API unavailable: {e}"}), 503
+    except Exception as e:
+        print(f"Error in /transcribe: {e}")
+        return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
 
 
 if __name__ == '__main__':
-    # ... (your NLTK and SpaCy resource checks) ...
-    try:
-        sid_test = SentimentIntensityAnalyzer()
-        nltk.data.find('tokenizers/punkt')
-        print("NLTK resources found.")
-    except LookupError as e:
-        print(f"NLTK resource missing: {e}")
-        # exit()
-
-    if NLP_SPACY is None:
-        print("SpaCy model 'en_core_web_sm' not loaded. Some NLP features might be limited.")
-        # exit() # Optionally exit
-
-    if conversations_collection is None:
-        print("Warning: MongoDB is not connected. Conversation logging will be skipped.")
-
-    else:
-        # You could add an else here if you want to confirm connection,
-        # but it's already printed in the try/except block during setup.
-        pass
-
-    app.run(debug=True, port=5000)
+    app.run(debug=True, port=5001)  # Run on a different port if your other app is on 5000
